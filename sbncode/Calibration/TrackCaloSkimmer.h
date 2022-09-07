@@ -55,6 +55,7 @@
 #include "lardata/DetectorInfoServices/DetectorPropertiesService.h"
 #include "lardata/DetectorInfoServices/DetectorClocksService.h"
 #include "larcore/Geometry/Geometry.h"
+#include "larcore/CoreUtils/ServiceUtil.h"
 #include "larcorealg/Geometry/GeometryCore.h"
 
 #include "nusimdata/SimulationBase/MCParticle.h"
@@ -97,6 +98,7 @@ private:
     geo::Point_t end;
     geo::Vector_t dir;
     geo::Vector_t enddir;
+    int ID;
   };
 
 
@@ -120,9 +122,13 @@ private:
     const recob::PFParticle &pfp, float t0, 
     const std::vector<art::Ptr<recob::Hit>> &hits,
     const std::vector<const recob::TrackHitMeta*> &thms,
+    const std::vector<art::Ptr<recob::SpacePoint>> &sps,
     const std::vector<art::Ptr<anab::Calorimetry>> &calo,
     const std::map<geo::WireID, art::Ptr<raw::RawDigit>> &rawdigits,
     const std::vector<GlobalTrackInfo> &tracks,
+    const geo::GeometryCore *geo,
+    const detinfo::DetectorClocksData &clock_data,
+    const cheat::BackTrackerService *bt_serv,
     const sbn::EDet det);
 
   void FillTrackDaughterRays(const recob::Track &trk,
@@ -142,13 +148,19 @@ private:
     const std::vector<geo::BoxBoundedGeo> &active_volumes,
     const std::vector<std::vector<geo::BoxBoundedGeo>> &tpc_volumes,
     const std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE*>>> id_to_ide_map,
-    const std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map);
+    const std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map,
+    const detinfo::DetectorPropertiesData &dprop,
+    const geo::GeometryCore *geo);
 
   TrackHitInfo MakeHit(const recob::Hit &hit,
     unsigned hkey,
     const recob::TrackHitMeta &thm,
     const recob::Track &trk,
-    const std::vector<art::Ptr<anab::Calorimetry>> &calo);
+    const art::Ptr<recob::SpacePoint> &sp,
+    const std::vector<art::Ptr<anab::Calorimetry>> &calo,
+    const geo::GeometryCore *geo,
+    const detinfo::DetectorClocksData &dclock,
+    const cheat::BackTrackerService *bt_serv);
 
   void DoTailFit();
 
@@ -156,9 +168,10 @@ private:
 
   // tags
   art::InputTag fPFPproducer;
-  art::InputTag fT0Producer;
+  std::vector<art::InputTag> fT0producers;
   art::InputTag fCALOproducer;
   art::InputTag fTRKproducer;
+  art::InputTag fTRKHMproducer;
   art::InputTag fHITproducer;
   std::vector<art::InputTag> fRawDigitproducers;
   std::string fG4producer;

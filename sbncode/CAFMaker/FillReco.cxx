@@ -61,10 +61,14 @@ namespace caf
   }
 
   void FillCRTHit(const sbn::crt::CRTHit &hit,
+                  uint64_t gate_start_timestamp,
                   bool use_ts0,
                   caf::SRCRTHit &srhit,
                   bool allowEmpty) {
-    srhit.time = (use_ts0 ? (float)hit.ts0_ns : hit.ts1_ns) / 1000.;
+
+    srhit.time = (use_ts0 ? (float)hit.ts0() : hit.ts1()) / 1000.;
+    srhit.t0 = ((long long)(hit.ts0())-(long long)(gate_start_timestamp))/1000.;
+    srhit.t1 = hit.ts1()/1000.;
 
     srhit.position.x = hit.x_pos;
     srhit.position.y = hit.y_pos;
@@ -107,6 +111,43 @@ namespace caf
     srtrack.hitb.plane = track.plane2;
   }
 
+  void FillOpFlash(const recob::OpFlash &flash,
+                  int cryo, 
+                  caf::SROpFlash &srflash,
+                  bool allowEmpty) {
+
+    srflash.setDefault();
+
+    srflash.time = flash.Time();
+    srflash.timewidth = flash.TimeWidth();
+    srflash.cryo = cryo; // 0 in SBND, 0/1 for E/W in ICARUS
+
+    // Sum over each wall, not very SBND-compliant
+    float sumEast = 0.;
+    float sumWest = 0.;
+    int countingOffset = 0;
+    if ( cryo == 1 ) countingOffset += 180;
+    for ( int PMT = 0 ; PMT < 180 ; PMT++ ) {
+      if ( PMT <= 89 ) sumEast += flash.PEs().at(PMT + countingOffset);
+      else sumWest += flash.PEs().at(PMT + countingOffset);
+    }
+    srflash.peperwall[0] = sumEast;
+    srflash.peperwall[1] = sumWest;
+
+    srflash.totalpe = flash.TotalPE();
+    srflash.fasttototal = flash.FastToTotal();
+    srflash.onbeamtime = flash.OnBeamTime();
+
+    srflash.center.SetXYZ( -9999.f, flash.YCenter(), flash.ZCenter() );
+    srflash.width.SetXYZ( -9999.f, flash.YWidth(), flash.ZWidth() );
+
+    // Checks if ( recob::OpFlash.XCenter() != std::numeric_limits<double>::max() )
+    // See LArSoft OpFlash.h at https://nusoft.fnal.gov/larsoft/doxsvn/html/OpFlash_8h_source.html
+    if ( flash.hasXCenter() ) {
+      srflash.center.SetX( flash.XCenter() );
+      srflash.width.SetX( flash.XWidth() );
+    }
+  }
 
   std::vector<float> double_to_float_vector(const std::vector<double>& v)
   {
@@ -127,18 +168,15 @@ namespace caf
   {
 
     srshower.producer = producer;
-    srshower.dEdx_plane0 = (shower.dEdx())[0];
-    srshower.dEdx_plane1 = (shower.dEdx())[1];
-    srshower.dEdx_plane2 = (shower.dEdx())[2];
+
     // We need to convert the energy from MeV to GeV
     // Also convert -999 -> -5 for consistency with other defaults in the CAFs
-    srshower.energy.clear();
-    std::transform(shower.Energy().begin(), shower.Energy().end(), std::back_inserter(srshower.energy),
-        [] (float e) {return e > 0 ? e / 1000.f : -5.f;});
-    srshower.energy_plane0 = srshower.energy[0];
-    srshower.energy_plane1 = srshower.energy[1];
-    srshower.energy_plane2 = srshower.energy[2];
-    srshower.dEdx   = double_to_float_vector( shower.dEdx() );
+    for(int i = 0; i < 3; ++i){
+      const float e = shower.Energy()[i];
+      srshower.plane[i].energy = e > 0 ? e / 1000.f : -5.f;
+      srshower.plane[i].dEdx = shower.dEdx()[i];
+    }
+
     srshower.dir    = SRVector3D( shower.Direction() );
     srshower.start  = SRVector3D( shower.ShowerStart() );
 
@@ -148,8 +186,8 @@ namespace caf
 
     if(shower.best_plane() != -999){
       srshower.bestplane        = shower.best_plane();
-      srshower.bestplane_dEdx   = srshower.dEdx.at(shower.best_plane());
-      srshower.bestplane_energy = srshower.energy.at(shower.best_plane());
+      srshower.bestplane_dEdx   = srshower.plane[shower.best_plane()].dEdx;
+      srshower.bestplane_energy = srshower.plane[shower.best_plane()].energy;
     }
 
     if(shower.has_open_angle())
@@ -173,30 +211,15 @@ namespace caf
       srshower.end = shower.ShowerStart()+ (shower.Length() * shower.Direction());
     }
 
-    for (auto const& hit:hits) {
-      switch (hit->WireID().Plane) {
-        case(0):
-          srshower.nHits_plane0++;
-        case(1):
-          srshower.nHits_plane1++;
-        case(2):
-          srshower.nHits_plane2++;
-      }
-    }
+    for(int p = 0; p < 3; ++p) srshower.plane[p].nHits = 0;
+    for (auto const& hit:hits) ++srshower.plane[hit->WireID().Plane].nHits;
 
     for (geo::PlaneGeo const& plane: geom->IteratePlanes()) {
 
       const double angleToVert(geom->WireAngleToVertical(plane.View(), plane.ID()) - 0.5*M_PI);
       const double cosgamma(std::abs(std::sin(angleToVert)*shower.Direction().Y()+std::cos(angleToVert)*shower.Direction().Z()));
 
-      switch (plane.ID().Plane) {
-        case(0):
-          srshower.wirePitch_plane0 = plane.WirePitch()/cosgamma;
-        case(1):
-          srshower.wirePitch_plane1 = plane.WirePitch()/cosgamma;
-        case(2):
-          srshower.wirePitch_plane2 = plane.WirePitch()/cosgamma;
-      }
+      srshower.plane[plane.ID().Plane].wirePitch = plane.WirePitch()/cosgamma;
     }
   }
 
@@ -273,6 +296,7 @@ namespace caf
     // default values
     srslice.nu_score = -1;
     srslice.is_clear_cosmic = true;
+    srslice.nuid.setDefault();
 
     // collect the properties
     if (primary_meta != NULL) {
@@ -291,6 +315,17 @@ namespace caf
       else {
         srslice.nu_score = -1;
       }
+      // NeutrinoID (SliceID) features
+      CopyPropertyIfSet(properties, "NuNFinalStatePfos",        srslice.nuid.nufspfos);
+      CopyPropertyIfSet(properties, "NuNHitsTotal",             srslice.nuid.nutothits);
+      CopyPropertyIfSet(properties, "NuVertexY",                srslice.nuid.nuvtxy);
+      CopyPropertyIfSet(properties, "NuWeightedDirZ",           srslice.nuid.nuwgtdirz);
+      CopyPropertyIfSet(properties, "NuNSpacePointsInSphere",   srslice.nuid.nusps);
+      CopyPropertyIfSet(properties, "NuEigenRatioInSphere",     srslice.nuid.nueigen);
+      CopyPropertyIfSet(properties, "CRLongestTrackDirY",       srslice.nuid.crlongtrkdiry);
+      CopyPropertyIfSet(properties, "CRLongestTrackDeflection", srslice.nuid.crlongtrkdef);
+      CopyPropertyIfSet(properties, "CRFracHitsInLongestTrack", srslice.nuid.crlongtrkhitfrac);
+      CopyPropertyIfSet(properties, "CRNHitsMax",               srslice.nuid.crmaxhits);
     }
 
   }
@@ -303,6 +338,33 @@ namespace caf
       slice.vertex.x = vertex->position().X();
       slice.vertex.y = vertex->position().Y();
       slice.vertex.z = vertex->position().Z();
+    }
+  }
+
+
+  void FillSliceCRUMBS(const sbn::CRUMBSResult *crumbs,
+                       caf::SRSlice& slice,
+                       bool allowEmpty) {
+    if (crumbs != nullptr) {
+      slice.crumbs_result.score = crumbs->score;
+      slice.crumbs_result.tpc.crlongtrackhitfrac = crumbs->tpc_CRFracHitsInLongestTrack;
+      slice.crumbs_result.tpc.crlongtrackdefl = crumbs->tpc_CRLongestTrackDeflection;
+      slice.crumbs_result.tpc.crlongtrackdiry = crumbs->tpc_CRLongestTrackDirY;
+      slice.crumbs_result.tpc.crnhitsmax = crumbs->tpc_CRNHitsMax;
+      slice.crumbs_result.tpc.nusphereeigenratio = crumbs->tpc_NuEigenRatioInSphere;
+      slice.crumbs_result.tpc.nufinalstatepfos = crumbs->tpc_NuNFinalStatePfos;
+      slice.crumbs_result.tpc.nutotalhits = crumbs->tpc_NuNHitsTotal;
+      slice.crumbs_result.tpc.nuspherespacepoints = crumbs->tpc_NuNSpacePointsInSphere;
+      slice.crumbs_result.tpc.nuvertexy = crumbs->tpc_NuVertexY;
+      slice.crumbs_result.tpc.nuwgtdirz = crumbs->tpc_NuWeightedDirZ;
+      slice.crumbs_result.tpc.stoppingchi2ratio = crumbs->tpc_StoppingChi2CosmicRatio;
+      slice.crumbs_result.pds.fmtotalscore = crumbs->pds_FMTotalScore;
+      slice.crumbs_result.pds.fmpe = crumbs->pds_FMPE;
+      slice.crumbs_result.pds.fmtime = crumbs->pds_FMTime;
+      slice.crumbs_result.crt.trackscore = crumbs->crt_TrackScore;
+      slice.crumbs_result.crt.hitscore = crumbs->crt_HitScore;
+      slice.crumbs_result.crt.tracktime = crumbs->crt_TrackTime;
+      slice.crumbs_result.crt.hittime = crumbs->crt_HitTime;
     }
   }
 
@@ -408,12 +470,44 @@ namespace caf
   }
 
   void FillPlaneChi2PID(const anab::ParticleID &particle_id, caf::SRTrkChi2PID &srpid) {
-    srpid.chi2_muon = particle_id.Chi2Muon();
-    srpid.chi2_pion = particle_id.Chi2Pion();
-    srpid.chi2_kaon = particle_id.Chi2Kaon();
-    srpid.chi2_proton = particle_id.Chi2Proton();
-    srpid.pid_ndof = particle_id.Ndf();
-    srpid.pida = particle_id.PIDA();
+
+    // Assign dummy values.
+
+    srpid.chi2_muon = 0.;
+    srpid.chi2_pion = 0.;
+    srpid.chi2_kaon = 0.;
+    srpid.chi2_proton = 0.;
+    srpid.pid_ndof = 0;
+    srpid.pida = 0.;
+
+    // Loop over algorithm scores and extract the ones we want.
+    // Get the ndof from any chi2 algorithm
+
+    std::vector<anab::sParticleIDAlgScores> AlgScoresVec = particle_id.ParticleIDAlgScores();
+    for (size_t i_algscore=0; i_algscore<AlgScoresVec.size(); i_algscore++){
+      anab::sParticleIDAlgScores AlgScore = AlgScoresVec.at(i_algscore);
+      if (AlgScore.fAlgName == "Chi2"){
+        if (TMath::Abs(AlgScore.fAssumedPdg) == 13) { // chi2mu
+          srpid.chi2_muon = AlgScore.fValue;
+          srpid.pid_ndof = AlgScore.fNdf;
+        }
+        else if (TMath::Abs(AlgScore.fAssumedPdg) == 211) { // chi2pi
+          srpid.chi2_pion = AlgScore.fValue;
+          srpid.pid_ndof = AlgScore.fNdf;
+        }
+        else if (TMath::Abs(AlgScore.fAssumedPdg) == 321) { // chi2ka
+          srpid.chi2_kaon = AlgScore.fValue;
+          srpid.pid_ndof = AlgScore.fNdf;
+        }
+        else if (TMath::Abs(AlgScore.fAssumedPdg) == 2212) { // chi2pr
+          srpid.chi2_proton = AlgScore.fValue;
+          srpid.pid_ndof = AlgScore.fNdf;
+        }
+      }
+      else if (AlgScore.fVariableType==anab::kPIDA){
+        srpid.pida = AlgScore.fValue;
+      }
+    }
   }
 
   void FillTrackChi2PID(const std::vector<art::Ptr<anab::ParticleID>> particleIDs,
@@ -427,8 +521,7 @@ namespace caf
       if (particle_id.PlaneID()) {
         unsigned plane_id  = particle_id.PlaneID().Plane;
         assert(plane_id < 3);
-        caf::SRTrkChi2PID &this_pid = (plane_id == 0) ? srtrack.chi2pid0 : ((plane_id == 1) ? srtrack.chi2pid1 : srtrack.chi2pid2);
-        FillPlaneChi2PID(particle_id, this_pid);
+        FillPlaneChi2PID(particle_id, srtrack.chi2pid[plane_id]);
       }
     }
   }
@@ -542,8 +635,7 @@ namespace caf
       if (calo.PlaneID()) {
         unsigned plane_id = calo.PlaneID().Plane;
         assert(plane_id < 3);
-        caf::SRTrackCalo &this_calo = (plane_id == 0) ? srtrack.calo0 : ((plane_id == 1) ? srtrack.calo1 : srtrack.calo2);
-        FillTrackPlaneCalo(calo, hits, fill_calo_points, fillhit_rrstart, fillhit_rrend, dprop, this_calo);
+        FillTrackPlaneCalo(calo, hits, fill_calo_points, fillhit_rrstart, fillhit_rrend, dprop, srtrack.calo[plane_id]);
       }
     }
 
@@ -551,15 +643,14 @@ namespace caf
     //
     // We expect the noise to be lowest at planes 2 -> 0 -> 1, so use this to break ties
     caf::Plane_t bestplane = caf::kUnknown;
-    if (srtrack.calo2.nhit > 0 && srtrack.calo2.nhit >= srtrack.calo0.nhit && srtrack.calo2.nhit >=  srtrack.calo1.nhit) {
-      bestplane = (caf::Plane_t)2;
+    int bestnhit = -1;
+    for(int plane: {2, 0, 1}){
+      if(srtrack.calo[plane].nhit > bestnhit){
+        bestplane = caf::Plane_t(plane);
+        bestnhit = srtrack.calo[plane].nhit;
+      }
     }
-    else if (srtrack.calo0.nhit > 0 && srtrack.calo0.nhit >= srtrack.calo2.nhit && srtrack.calo0.nhit >=  srtrack.calo1.nhit) {
-      bestplane = (caf::Plane_t)0;
-    }
-    else if (srtrack.calo1.nhit > 1) {
-      bestplane = (caf::Plane_t)1;
-    }
+
     srtrack.bestplane = bestplane;
 
   }
@@ -759,5 +850,12 @@ namespace caf
     return;
   }
 
+  //......................................................................
+  template<class T, class U>
+  void CopyPropertyIfSet( const std::map<std::string, T>& props, const std::string& search, U& value )
+  {
+    auto it = props.find(search);
+    if ( it != props.end() ) value = it->second;
+  }
 
 } // end namespace

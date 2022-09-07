@@ -13,7 +13,7 @@
 #include "fhiclcpp/ParameterSet.h"
 #include "messagefacility/MessageLogger/MessageLogger.h"
 #include "CLHEP/Random/RandFlat.h"
-#include "IFDH_service.h"
+#include "ifdh_art/IFDHService/IFDH_service.h"
 
 #include "nusimdata/SimulationBase/MCFlux.h"
 
@@ -69,7 +69,7 @@ public:
     double LoadPOT();
 
     // no weights
-    float MaxWeight() override { return -1.; }
+    double MaxWeight() override { return -1.; }
 
 private:
   // config

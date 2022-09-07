@@ -105,15 +105,27 @@ protected:
   std::string fSpillTimeConfig;
 
   TLorentzVector BeamOrigin() {
-    float toff = fTimeShiftMethod ? fTimeShiftMethod->TimeOffset() : 0.;
+    double toff = fTimeShiftMethod ? fTimeShiftMethod->TimeOffset() : 0.;
 
     // TODO: what to do here? For now -- don't shift time at all
     //
     // subtract out the delay of neutrinos reaching the beam
-    // float neutrino_tif = fBeamOrigin.Mag()/Constants::Instance().c_cm_per_ns;
+    // double neutrino_tif = fBeamOrigin.Mag()/Constants::Instance().c_cm_per_ns;
     // toff -= neutrino_tif;
     return TLorentzVector(fBeamOrigin, toff);
   }
+
+  // Compute the equivalent neutrino energy for a given parent meson position / momentum 
+  double EnuLab(double enucm, TLorentzVector meson_mom, TLorentzVector meson_pos) { // all in detector coordinates
+    // Assume neutrino travels to center of detector
+    double costh = meson_mom.Vect().Unit().Dot(-meson_pos.Vect().Unit());
+
+    // Scale factor
+    double M = 1. / (meson_mom.Gamma() * (1 - meson_mom.Beta() * costh));
+
+    return M * enucm;
+  }
+
 };
 
 } // namespace ldm

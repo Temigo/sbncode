@@ -64,32 +64,37 @@ public:
     int RandDaughter(double elec_width, double muon_width, double piplus_width, double pizero_width);
 
     // returns the max weight of configured
-    float MaxWeight() override { 
+    double MaxWeight() override { 
       return fMaxWeight; 
     }
 
 private:
-  float fReferenceRayLength;
-  float fReferenceRayDistance;
-  float fReferenceHiggsMass;
-  float fReferenceHiggsMixing;
-  float fReferenceHiggsEnergy;
-  float fReferenceHiggsKaonEnergy;
+  double fReferenceRayLength;
+  double fReferenceRayDistance;
+  double fReferenceHiggsMass;
+  double fReferenceHiggsMixing;
+  double fReferenceHiggsEnergy;
+  double fReferenceHiggsKaonEnergy;
 
-  float fMaxWeight;
+  double fMaxWeight;
+
+  bool fAllowElectronDecay;
+  bool fAllowMuonDecay;
+  bool fAllowPionDecay;
+  bool fAllowPi0Decay;
   
 };
 
 // converts a random number (x) between 0 and 1 to a number
 // from an exponential distribution with mean forced to lie 
 // between a and b
-float flat_to_exp_rand(float x, float mean, float a, float b) {
-  float A = (1. - exp(-(b-a)/mean));
+double flat_to_exp_rand(double x, double mean, double a, double b) {
+  double A = (1. - exp(-(b-a)/mean));
   return - mean * log(1 - x * A) + a;
 }
 
 // returns the weight associated with forcing the decay to happen within a center length
-double forcedecay_weight(float mean, float a, float b) {
+double forcedecay_weight(double mean, double a, double b) {
     return exp(-a/mean) - exp(-b/mean);
 }
 
@@ -156,12 +161,17 @@ HiggsMakeDecay::~HiggsMakeDecay()
 //------------------------------------------------------------------------------------------------------------------------------------------
 void HiggsMakeDecay::configure(fhicl::ParameterSet const &pset)
 {
-  fReferenceRayLength = pset.get<float>("ReferenceRayLength", -1);
-  fReferenceRayDistance = pset.get<float>("ReferenceRayDistance", 0.);
-  fReferenceHiggsMass = pset.get<float>("ReferenceHiggsMass", -1);
-  fReferenceHiggsMixing = pset.get<float>("ReferenceHiggsMixing", -1);
-  fReferenceHiggsEnergy = pset.get<float>("ReferenceHiggsEnergy", -1);
-  fReferenceHiggsKaonEnergy = pset.get<float>("ReferenceHiggsEnergyFromKaonEnergy", -1.);
+  fReferenceRayLength = pset.get<double>("ReferenceRayLength", -1);
+  fReferenceRayDistance = pset.get<double>("ReferenceRayDistance", 0.);
+  fReferenceHiggsMass = pset.get<double>("ReferenceHiggsMass", -1);
+  fReferenceHiggsMixing = pset.get<double>("ReferenceHiggsMixing", -1);
+  fReferenceHiggsEnergy = pset.get<double>("ReferenceHiggsEnergy", -1);
+  fReferenceHiggsKaonEnergy = pset.get<double>("ReferenceHiggsEnergyFromKaonEnergy", -1.);
+
+  fAllowElectronDecay = pset.get<bool>("AllowElectronDecay", true);
+  fAllowMuonDecay = pset.get<bool>("AllowMuonDecay", true);
+  fAllowPionDecay = pset.get<bool>("AllowPionDecay", true);
+  fAllowPi0Decay = pset.get<bool>("AllowPi0Decay", true);
 
   if (fReferenceHiggsEnergy < 0. && fReferenceHiggsKaonEnergy > 0.) {
     fReferenceHiggsEnergy = std::min(forwardPrtlEnergy(Constants::Instance().kplus_mass, Constants::Instance().piplus_mass, fReferenceHiggsMass, fReferenceHiggsKaonEnergy),
@@ -180,11 +190,15 @@ void HiggsMakeDecay::configure(fhicl::ParameterSet const &pset)
     double lifetime_ns = Constants::Instance().hbar / (width_elec + width_muon + width_piplus + width_pizero);
 
     // multiply by gamma*v to get the length
-    float gamma_v = sqrt(fReferenceHiggsEnergy * fReferenceHiggsEnergy - fReferenceHiggsMass * fReferenceHiggsMass) * Constants::Instance().c_cm_per_ns / fReferenceHiggsMass;
-    float mean_dist = lifetime_ns * gamma_v;
+    double gamma_v = sqrt(fReferenceHiggsEnergy * fReferenceHiggsEnergy - fReferenceHiggsMass * fReferenceHiggsMass) * Constants::Instance().c_cm_per_ns / fReferenceHiggsMass;
+    double mean_dist = lifetime_ns * gamma_v;
 
     // compute the decay weight
     fMaxWeight = forcedecay_weight(mean_dist, fReferenceRayDistance, fReferenceRayDistance + fReferenceRayLength);
+
+    // Scale by the allowed BR
+    fMaxWeight *= (width_elec*fAllowElectronDecay + width_muon*fAllowMuonDecay + width_piplus*fAllowPionDecay + width_pizero*fAllowPi0Decay) / (width_elec + width_muon + width_piplus + width_pizero);
+
   }
   else {
     fMaxWeight = -1.;
@@ -232,11 +246,11 @@ bool HiggsMakeDecay::Decay(const MeVPrtlFlux &flux, const TVector3 &in, const TV
   double lifetime_ns = Constants::Instance().hbar / (width_elec + width_muon + width_piplus + width_pizero);
 
   // multiply by gamma*v to get the length
-  float mean_dist = lifetime_ns * flux.mom.Gamma() * flux.mom.Beta() * Constants::Instance().c_cm_per_ns;
+  double mean_dist = lifetime_ns * flux.mom.Gamma() * flux.mom.Beta() * Constants::Instance().c_cm_per_ns;
 
   // distance inside detector
-  float in_dist = (flux.pos.Vect() - in).Mag();
-  float out_dist = (flux.pos.Vect() - out).Mag();
+  double in_dist = (flux.pos.Vect() - in).Mag();
+  double out_dist = (flux.pos.Vect() - out).Mag();
 
   // compute the decay weight
   weight = forcedecay_weight(mean_dist, in_dist, out_dist);
@@ -247,23 +261,26 @@ bool HiggsMakeDecay::Decay(const MeVPrtlFlux &flux, const TVector3 &in, const TV
     return false;
   }
 
+  // Scale by the allowed BR
+  weight *= (width_elec*fAllowElectronDecay + width_muon*fAllowMuonDecay + width_piplus*fAllowPionDecay + width_pizero*fAllowPi0Decay) / (width_elec + width_muon + width_piplus + width_pizero);
+
   // get the decay location
-  float flat_rand = CLHEP::RandFlat::shoot(fEngine, 0, 1.);
-  float decay_rand = flat_to_exp_rand(flat_rand, mean_dist, in_dist, out_dist);
+  double flat_rand = CLHEP::RandFlat::shoot(fEngine, 0, 1.);
+  double decay_rand = flat_to_exp_rand(flat_rand, mean_dist, in_dist, out_dist);
   TVector3 decay_pos3 = flux.pos.Vect() + decay_rand * (in - flux.pos.Vect()).Unit();
 
   // decay time
-  float decay_time = TimeOfFlight(flux, decay_pos3);
+  double decay_time = TimeOfFlight(flux, decay_pos3);
   TLorentzVector decay_pos(decay_pos3, decay_time);
 
   // get the decay type
-  int daughter_pdg = RandDaughter(width_elec, width_muon, width_piplus, width_pizero);
+  int daughter_pdg = RandDaughter(width_elec*fAllowElectronDecay, width_muon*fAllowMuonDecay, width_piplus*fAllowPionDecay, width_pizero*fAllowPi0Decay);
 
   double daughter_mass = TDatabasePDG::Instance()->GetParticle(daughter_pdg)->Mass();
 
   // daughter mom+energy in the parent rest-frame
-  float daughterE_HRF = flux.mass / 2.;
-  float daughterP_HRF = sqrt(daughterE_HRF * daughterE_HRF - daughter_mass * daughter_mass);
+  double daughterE_HRF = flux.mass / 2.;
+  double daughterP_HRF = sqrt(daughterE_HRF * daughterE_HRF - daughter_mass * daughter_mass);
 
   // make the two daughters in the higgs rest-frame with a random direction
   TVector3 pA_HRF = RandomUnitVector() * daughterP_HRF;

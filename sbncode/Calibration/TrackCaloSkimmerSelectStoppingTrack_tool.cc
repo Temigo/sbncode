@@ -8,6 +8,7 @@
 #include "lardata/DetectorInfoServices/DetectorPropertiesService.h"
 #include "lardata/DetectorInfoServices/DetectorClocksService.h"
 #include "larcore/Geometry/Geometry.h"
+#include "larcore/CoreUtils/ServiceUtil.h"
 #include "larcorealg/Geometry/GeometryCore.h"
 
 #include "ITCSSelectionTool.h"
@@ -51,7 +52,9 @@ private:
   // Fiducial time
   double fFidTickMin;
   double fFidTickMax;
+  double fMediandQdxRRMax;
 
+  bool fCheckFiducialX;
 };
 
 TrackCaloSkimmerSelectStoppingTrack::TrackCaloSkimmerSelectStoppingTrack(const fhicl::ParameterSet &p):
@@ -66,7 +69,9 @@ TrackCaloSkimmerSelectStoppingTrack::TrackCaloSkimmerSelectStoppingTrack(const f
   fMaxTimeTickInset(p.get<double>("MaxTimeTickInset")),
   fEndMediandQdxCut(p.get<double>("EndMediandQdxCut")),
   fNumberTimeSamples(p.get<unsigned>("NumberTimeSamples")),
-  fRequireDownwards(p.get<bool>("RequireDownwards", true))
+  fRequireDownwards(p.get<bool>("RequireDownwards", true)),
+  fMediandQdxRRMax(p.get<double>("MediandQdxRRMax", 5.)),
+  fCheckFiducialX(p.get<bool>("CheckFiducialX"))
 {
   // Get the fiducial volume info
   const geo::GeometryCore *geometry = lar::providerFrom<geo::Geometry>();
@@ -120,7 +125,9 @@ bool TrackCaloSkimmerSelectStoppingTrack::Select(const TrackInfo &t) {
   for (const geo::BoxBoundedGeo &g: fFiducialVolumes) {
     geo::Point_t end {t.end.x, t.end.y, t.end.z};
 
-    if (g.ContainsPosition(end)) {
+    bool is_contained = fCheckFiducialX ? g.ContainsPosition(end) : g.ContainsYZ(end.Y(), end.Z());
+
+    if (is_contained) {
       end_is_fid = true;
       break;
     }
@@ -133,10 +140,10 @@ bool TrackCaloSkimmerSelectStoppingTrack::Select(const TrackInfo &t) {
     (t.hit_min_time_p2_tpcW < 0. || t.hit_min_time_p2_tpcW > fFidTickMin) &&
     (t.hit_max_time_p2_tpcW < 0. || t.hit_max_time_p2_tpcW < fFidTickMax);
 
-  // compute the median dqdx of the last 5 cm
+  // compute the median dqdx of the last few cm -- using fMediandQdxRRMax
   std::vector<double> endp_dqdx;
   for (const sbn::TrackHitInfo &h: t.hits2) {
-    if (h.oncalo && h.rr < 5.) endp_dqdx.push_back(h.dqdx);
+    if (h.oncalo && h.rr < fMediandQdxRRMax) endp_dqdx.push_back(h.dqdx);
   }
   double med_dqdx = -1;
   if (endp_dqdx.size()) {

@@ -63,9 +63,10 @@ sbn::TrackCaloSkimmer::TrackCaloSkimmer(fhicl::ParameterSet const& p)
 {
   // Grab config
   fPFPproducer  = p.get< art::InputTag > ("PFPproducer","pandoraGausCryo0");
-  fT0Producer   = p.get< art::InputTag > ("T0producer", "pandoraGausCryo0");
+  fT0producers   = p.get< std::vector<art::InputTag> > ("T0producers", {"pandoraGausCryo0"} );
   fCALOproducer = p.get< art::InputTag > ("CALOproducer");
   fTRKproducer  = p.get< art::InputTag > ("TRKproducer" );
+  fTRKHMproducer= p.get< art::InputTag   > ("TRKHMproducer", "");
   fHITproducer  = p.get< art::InputTag > ("HITproducer" );
   fG4producer  = p.get< std::string > ("G4producer" );
   fSimChannelproducer  = p.get< std::string > ("SimChannelproducer" );
@@ -208,7 +209,10 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
   }
 
   // PFP-associated data
-  art::FindManyP<anab::T0> fmT0(PFParticleList, e, fT0Producer);
+  std::vector<art::FindManyP<anab::T0>> fmT0;
+  for (unsigned i_label = 0; i_label < fT0producers.size(); i_label++) {
+    fmT0.emplace_back(PFParticleList, e, fT0producers[i_label]);
+  }
   art::FindManyP<recob::SpacePoint> PFParticleSPs(PFParticleList, e, fPFPproducer);
 
   // Now we don't need to guard access to further data. If this is an empty event it should be caught by PFP's or Hit's
@@ -216,7 +220,9 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
 
   // Track - associated data
   art::FindManyP<recob::Track> fmTracks(PFParticleList, e, fTRKproducer);
-  art::FindManyP<recob::Hit, recob::TrackHitMeta> fmtrkHits(tracks, e, fTRKproducer);
+
+  art::InputTag thm_label = fTRKHMproducer.empty() ? fTRKproducer : fTRKHMproducer;
+  art::FindManyP<recob::Hit, recob::TrackHitMeta> fmtrkHits(tracks, e, thm_label);
   art::FindManyP<anab::Calorimetry> fmCalo(tracks, e, fCALOproducer);
 
   // Collect raw digits for saving hits
@@ -261,10 +267,13 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
   // Use helper functions from CAFMaker/FillTrue
   std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE*>>> id_to_ide_map;
   std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map;
+  const cheat::BackTrackerService *bt = NULL;
+
   if (simchannels.size()) {
     art::ServiceHandle<cheat::BackTrackerService> bt_serv;
     id_to_ide_map = caf::PrepSimChannels(simchannels, *geometry);
     id_to_truehit_map = caf::PrepTrueHits(allHits, clock_data, *bt_serv.get());
+    bt = bt_serv.get();
   }
 
   // service data
@@ -273,7 +282,7 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
   std::vector<GlobalTrackInfo> track_infos;
   for (const recob::Track &t: *tracks) {
     track_infos.push_back({
-      t.Start(), t.End(), t.StartDirection(), t.EndDirection()
+      t.Start(), t.End(), t.StartDirection(), t.EndDirection(), t.ID()
     });
   }
 
@@ -292,13 +301,39 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
     std::vector<art::Ptr<recob::Hit>> emptyHitVector;
     const std::vector<art::Ptr<recob::Hit>> &trkHits  = fmtrkHits.isValid() ? fmtrkHits.at(trkPtr.key()) : emptyHitVector;
 
+    art::FindManyP<recob::SpacePoint> fmtrkHitSPs(trkHits, e, fPFPproducer);
+
     std::vector<const recob::TrackHitMeta*> emptyTHMVector;
     const std::vector<const recob::TrackHitMeta*> &trkHitMetas = fmtrkHits.isValid() ? fmtrkHits.data(trkPtr.key()) : emptyTHMVector;
 
-    float t0 = std::numeric_limits<float>::signaling_NaN();
-    if (fmT0.isValid() && fmT0.at(p_pfp.key()).size()) t0 = fmT0.at(p_pfp.key()).at(0)->Time();
+    art::Ptr<recob::SpacePoint> nullSP;
+    std::vector<art::Ptr<recob::SpacePoint>> trkHitSPs;
+    if (fmtrkHitSPs.isValid()) {
+      for (unsigned i_hit = 0; i_hit < trkHits.size(); i_hit++) {
+        const std::vector<art::Ptr<recob::SpacePoint>> &h_sp = fmtrkHitSPs.at(i_hit);
+        if (h_sp.size()) {
+          trkHitSPs.push_back(h_sp.at(0));
+        }
+        else {
+          trkHitSPs.push_back(nullSP);
+        }
+      }
+    }
 
-    if (fRequireT0 && fmT0.at(p_pfp.key()).size() == 0) {
+    int whicht0 = -1;
+    float t0 = std::numeric_limits<float>::signaling_NaN();
+    for (unsigned i_t0 = 0; i_t0 < fmT0.size(); i_t0++) {
+      if (fmT0[i_t0].isValid() && fmT0[i_t0].at(p_pfp.key()).size()) {
+        t0 = fmT0[i_t0].at(p_pfp.key()).at(0)->Time();
+        whicht0 = i_t0;
+
+        if (fVerbose) std::cout << "Track: " << trkPtr->ID() << " Has T0 (" << fT0producers[i_t0] << ")\n";
+
+        break;
+      }
+    }
+
+    if (fRequireT0 && whicht0 < 0) {
       continue;
     }
 
@@ -312,14 +347,15 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
     fWiresToSave.clear();
 
     // Fill the track!
-    FillTrack(*trkPtr, pfp, t0, trkHits, trkHitMetas, calo, rawdigits, track_infos, det);
+    FillTrack(*trkPtr, pfp, t0, trkHits, trkHitMetas, trkHitSPs, calo, rawdigits, track_infos, geometry, clock_data, bt, det);
+    fTrack->whicht0 = whicht0;
 
     FillTrackDaughterRays(*trkPtr, pfp, PFParticleList, PFParticleSPs);
 
     if (fFillTrackEndHits) FillTrackEndHits(geometry, dprop, *trkPtr, allHits, allHitSPs);
 
     // Fill the truth information if configured
-    if (simchannels.size()) FillTrackTruth(clock_data, trkHits, mcparticles, AVs, TPCVols, id_to_ide_map, id_to_truehit_map); 
+    if (simchannels.size()) FillTrackTruth(clock_data, trkHits, mcparticles, AVs, TPCVols, id_to_ide_map, id_to_truehit_map, dprop, geometry); 
 
     // Save?
     bool select = false;
@@ -336,10 +372,10 @@ void sbn::TrackCaloSkimmer::analyze(art::Event const& e)
       }
       i_select ++;
     }
-  
+
     // Save!
     if (select) {
-      if (fVerbose) std::cout << "Track Selected!\n";
+      if (fVerbose) std::cout << "Track Selected! By tool: " << i_select << std::endl;
       fTree->Fill();
     }
   }
@@ -404,12 +440,53 @@ sbn::Vector3D ConvertTVector(const TVector3 &tv) {
   return v;
 }
 
+// Turn a particle position to a space-charge induced position
+geo::Point_t TrajectoryToWirePosition(const geo::Point_t &loc, const geo::TPCID &tpc) {
+  auto const* sce = lar::providerFrom<spacecharge::SpaceChargeService>();
+  art::ServiceHandle<geo::Geometry const> geom;
+
+  geo::Point_t ret = loc;
+
+  // Returned X is the drift -- multiply by the drift direction to undo this
+  int corr = geom->TPC(tpc.TPC).DriftDir()[0];
+  
+  if (sce && sce->EnableSimSpatialSCE()) {
+    geo::Vector_t offset = sce->GetPosOffsets(ret);
+  
+    ret.SetX(ret.X() + corr * offset.X());
+    ret.SetY(ret.Y() + offset.Y());
+    ret.SetZ(ret.Z() + offset.Z());
+  }
+
+  return ret;
+}
+
+// Turn a space-charge induced position to a trajectory Position
+geo::Point_t WireToTrajectoryPosition(const geo::Point_t &loc, const geo::TPCID &tpc) {
+  auto const* sce = lar::providerFrom<spacecharge::SpaceChargeService>();
+
+  geo::Point_t ret = loc;
+
+  if (sce && sce->EnableSimSpatialSCE()) {
+    geo::Vector_t offset = sce->GetCalPosOffsets(ret, tpc.TPC);
+
+    ret.SetX(ret.X() + offset.X());
+    ret.SetY(ret.Y() + offset.Y());
+    ret.SetZ(ret.Z() + offset.Z());
+  }
+
+  return ret;
+  
+}
+
 // Collect MCParticle information
 sbn::TrueParticle TrueParticleInfo(const simb::MCParticle &particle,
     const std::vector<geo::BoxBoundedGeo> &active_volumes,
     const std::vector<std::vector<geo::BoxBoundedGeo>> &tpc_volumes,
     const std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE *>>> &id_to_ide_map,
-    const std::map<int, std::vector<art::Ptr<recob::Hit>>> &id_to_truehit_map) {
+    const std::map<int, std::vector<art::Ptr<recob::Hit>>> &id_to_truehit_map, 
+    const detinfo::DetectorPropertiesData &dprop,
+    const geo::GeometryCore *geo) {
 
   std::vector<std::pair<geo::WireID, const sim::IDE *>> empty;
   const std::vector<std::pair<geo::WireID, const sim::IDE *>> &particle_ides = id_to_ide_map.count(particle.TrackId()) ? id_to_ide_map.at(particle.TrackId()) : empty;
@@ -577,6 +654,181 @@ sbn::TrueParticle TrueParticleInfo(const simb::MCParticle &particle,
   trueparticle.G4ID = particle.TrackId();
   trueparticle.parent = particle.Mother();
 
+  // Organize deposition info into per-wire true "Hits" -- key is the Channel Number
+  std::map<unsigned, sbn::TrueHit> truehits; 
+
+  for (auto const &ide_pair: particle_ides) {
+    const geo::WireID &w = ide_pair.first;
+    unsigned c = geo->PlaneWireToChannel(w);
+    const sim::IDE *ide = ide_pair.second;
+
+    // Set stuff
+    truehits[c].cryo = w.Cryostat;
+    truehits[c].tpc = w.TPC;
+    truehits[c].plane = w.Plane;
+    truehits[c].wire = w.Wire;
+    truehits[c].channel = c;
+
+    // Average stuff using charge-weighting
+    float old_elec = truehits[c].nelec;
+    float new_elec = old_elec + ide->numElectrons;
+    truehits[c].p.x = (truehits[c].p.x*old_elec + ide->x*ide->numElectrons) / new_elec;
+    truehits[c].p.y = (truehits[c].p.y*old_elec + ide->y*ide->numElectrons) / new_elec;
+    truehits[c].p.z = (truehits[c].p.z*old_elec + ide->z*ide->numElectrons) / new_elec;
+
+    // Also get the position with space charge un-done
+    geo::Point_t ide_p(ide->x, ide->y, ide->z);
+    geo::Point_t ide_p_scecorr = WireToTrajectoryPosition(ide_p, w);
+
+    truehits[c].p_scecorr.x = (truehits[c].p_scecorr.x*old_elec + ide_p_scecorr.x()*ide->numElectrons) / new_elec; 
+    truehits[c].p_scecorr.y = (truehits[c].p_scecorr.y*old_elec + ide_p_scecorr.y()*ide->numElectrons) / new_elec; 
+    truehits[c].p_scecorr.z = (truehits[c].p_scecorr.z*old_elec + ide_p_scecorr.z()*ide->numElectrons) / new_elec; 
+    
+    // Sum stuff
+    truehits[c].nelec += ide->numElectrons;
+    truehits[c].e += ide->energy;
+    truehits[c].ndep += 1;
+  }
+
+  // Compute widths
+  for (auto const &ide_pair: particle_ides) {
+    const geo::WireID &w = ide_pair.first;
+    unsigned c = geo->PlaneWireToChannel(w);
+    const sim::IDE *ide = ide_pair.second;
+
+    geo::Point_t ide_p(ide->x, ide->y, ide->z);
+    geo::Point_t ide_p_scecorr = WireToTrajectoryPosition(ide_p, w);
+
+    // Average stuff using charge-weighting
+    float this_elec = ide->numElectrons;
+
+    truehits[c].p_width.x += (ide_p.x() - truehits[c].p.x) * (ide_p.x() - truehits[c].p.x) * this_elec / truehits[c].nelec;
+    truehits[c].p_width.y += (ide_p.y() - truehits[c].p.y) * (ide_p.y() - truehits[c].p.y) * this_elec / truehits[c].nelec;
+    truehits[c].p_width.z += (ide_p.z() - truehits[c].p.z) * (ide_p.z() - truehits[c].p.z) * this_elec / truehits[c].nelec;
+
+    truehits[c].p_scecorr_width.x += (ide_p_scecorr.x() - truehits[c].p_scecorr.x) * (ide_p_scecorr.x() - truehits[c].p_scecorr.x) * this_elec / truehits[c].nelec;
+    truehits[c].p_scecorr_width.y += (ide_p_scecorr.y() - truehits[c].p_scecorr.y) * (ide_p_scecorr.y() - truehits[c].p_scecorr.y) * this_elec / truehits[c].nelec;
+    truehits[c].p_scecorr_width.z += (ide_p_scecorr.z() - truehits[c].p_scecorr.z) * (ide_p_scecorr.z() - truehits[c].p_scecorr.z) * this_elec / truehits[c].nelec;
+  }
+
+  // Convert to vector
+  std::vector<sbn::TrueHit> truehits_v;
+  for (auto const &p: truehits) {
+    truehits_v.push_back(p.second);
+  }
+
+  // Compute the time of each hit
+  for (sbn::TrueHit &h: truehits_v) {
+    h.time = dprop.ConvertXToTicks(h.p.x, h.plane, h.tpc, h.cryo);
+
+    double xdrift = abs(h.p.x - geo->TPC(h.tpc, h.cryo).PlaneLocation(0)[0]);
+    h.tdrift = xdrift / dprop.DriftVelocity(); 
+  }
+
+  // Compute the pitch of each hit and order it in the trajectory
+  for (sbn::TrueHit &h: truehits_v) {
+    // Use the SCE-undone hit since this matches to the Trajectory
+    TVector3 h_p(h.p_scecorr.x, h.p_scecorr.y, h.p_scecorr.z);
+
+    TVector3 direction;
+    float closest_dist = -1.;
+    int traj_index = -1;
+    for (unsigned i_traj = 0; i_traj < particle.NumberTrajectoryPoints(); i_traj++) {
+      if (closest_dist < 0. || (particle.Position(i_traj).Vect() - h_p).Mag() < closest_dist) {
+        direction = particle.Momentum(i_traj).Vect().Unit();
+        closest_dist = (particle.Position(i_traj).Vect() - h_p).Mag();
+        traj_index = i_traj;
+      }
+    }
+
+    // If we got a direction, get the pitch
+    if (closest_dist >= 0. && direction.Mag() > 1e-4) {
+      geo::PlaneID plane(h.cryo, h.tpc, h.plane);
+      float angletovert = geo->WireAngleToVertical(geo->View(plane), plane) - 0.5*::util::pi<>();
+      float cosgamma = abs(cos(angletovert) * direction.Z() + sin(angletovert) * direction.Y());
+      float pitch = geo->WirePitch(plane) / cosgamma;
+      h.pitch = pitch;
+    }
+    else {
+      h.pitch = -1.;
+    }
+    // And the pitch induced by SCE
+    if (closest_dist >= 0. && direction.Mag() > 1e-4) {
+      geo::PlaneID plane(h.cryo, h.tpc, h.plane);
+      float angletovert = geo->WireAngleToVertical(geo->View(plane), plane) - 0.5*::util::pi<>();
+
+      TVector3 loc_mdx_v = h_p - direction * (geo->WirePitch(geo->View(plane) / 2.));
+      TVector3 loc_pdx_v = h_p + direction * (geo->WirePitch(geo->View(plane) / 2.));
+
+      // Convert types for helper functions
+      geo::Point_t loc_mdx(loc_mdx_v.X(), loc_mdx_v.Y(), loc_mdx_v.Z());
+      geo::Point_t loc_pdx(loc_pdx_v.X(), loc_pdx_v.Y(), loc_pdx_v.Z());
+      geo::Point_t h_p_point(h_p.X(), h_p.Y(), h_p.Z());
+
+      loc_mdx = TrajectoryToWirePosition(loc_mdx, plane);
+      loc_pdx = TrajectoryToWirePosition(loc_pdx, plane);
+      
+      // Direction at wires
+      geo::Vector_t dir = (loc_pdx - loc_mdx) /  (loc_mdx - loc_pdx).r(); 
+
+      // Pitch at wires
+      double cosgamma = std::abs(std::sin(angletovert)*dir.Y() + std::cos(angletovert)*dir.Z());
+      double pitch;
+      if (cosgamma) {
+        pitch = geo->WirePitch(geo->View(plane))/cosgamma;
+      }
+      else {
+        pitch = 0.;
+      }
+
+      // Now bring that back to the particle trajectory
+      geo::Point_t loc_w = TrajectoryToWirePosition(h_p_point, plane);
+      
+      geo::Point_t locw_pdx_traj = WireToTrajectoryPosition(loc_w + pitch*dir, plane);
+      geo::Point_t loc = WireToTrajectoryPosition(loc_w, plane);
+      
+      h.pitch_sce = (locw_pdx_traj - loc).R();
+    }
+    else {
+      h.pitch_sce = -1.;
+    }
+
+    // And the trajectory location
+    h.itraj = traj_index;
+
+    // And the residual range of the hit
+    h.rr = 0.;
+    if (traj_index >= 0) {
+      for (int i_traj = traj_index+1; i_traj < (int)particle.NumberTrajectoryPoints(); i_traj++) {
+        h.rr += (particle.Position(i_traj).Vect() - particle.Position(i_traj-1).Vect()).Mag();
+      }
+
+      // Also account for the distance from the Hit point to the matched trajectory point
+      double hit_distance_along_particle = (h_p - particle.Position(traj_index).Vect()).Dot(particle.Momentum(traj_index).Vect().Unit());
+      h.rr += -hit_distance_along_particle;
+
+    }
+  }
+
+  // Order the hits by their location along the trajectory, start to end
+  std::sort(truehits_v.begin(), truehits_v.end(), 
+    [](auto const &lhs, auto const &rhs) {
+      return lhs.itraj < rhs.itraj;
+  });
+
+  // Save depositions into the True Particle
+  for (sbn::TrueHit &h: truehits_v) {
+    if (h.plane == 0) {
+      trueparticle.truehits0.push_back(h);
+    }
+    else if (h.plane == 1) {
+      trueparticle.truehits1.push_back(h);
+    }
+    else if (h.plane == 2) {
+      trueparticle.truehits2.push_back(h);
+    }
+  }
+
   return trueparticle;
 }
 
@@ -635,9 +887,14 @@ void sbn::TrackCaloSkimmer::FillTrackEndHits(const geo::GeometryCore *geometry,
       const std::vector<art::Ptr<recob::SpacePoint>> &h_sp = allHitSPs.at(hit.key());
       if (h_sp.size()) {
         const recob::SpacePoint &sp = *h_sp[0];
-        hinfo.p.x = sp.position().x();
-        hinfo.p.y = sp.position().y();
-        hinfo.p.z = sp.position().z();
+        hinfo.sp.x = sp.position().x();
+        hinfo.sp.y = sp.position().y();
+        hinfo.sp.z = sp.position().z();
+
+        hinfo.hasSP = true;
+      }
+      else {
+        hinfo.hasSP = false;
       }
 
       fTrack->endhits.push_back(hinfo);
@@ -653,7 +910,9 @@ void sbn::TrackCaloSkimmer::FillTrackTruth(const detinfo::DetectorClocksData &cl
     const std::vector<geo::BoxBoundedGeo> &active_volumes,
     const std::vector<std::vector<geo::BoxBoundedGeo>> &tpc_volumes,
     const std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE*>>> id_to_ide_map,
-    const std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map) {
+    const std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map,
+    const detinfo::DetectorPropertiesData &dprop,
+    const geo::GeometryCore *geo) {
 
   // Lookup the true-particle match -- use utils in CAF
   std::vector<std::pair<int, float>> matches = CAFRecoUtils::AllTrueParticleIDEnergyMatches(clock_data, trkHits, true);
@@ -677,7 +936,7 @@ void sbn::TrackCaloSkimmer::FillTrackTruth(const detinfo::DetectorClocksData &cl
     for (const art::Ptr<simb::MCParticle> &p_mcp: mcparticles) {
       if (p_mcp->TrackId() == bestmatch.first) {
         if (fVerbose) std::cout << "Matched! Track ID: " << p_mcp->TrackId() << " pdg: " << p_mcp->PdgCode() << " process: " << p_mcp->EndProcess() << std::endl;
-        fTrack->truth.p = TrueParticleInfo(*p_mcp, active_volumes, tpc_volumes, id_to_ide_map, id_to_truehit_map);
+        fTrack->truth.p = TrueParticleInfo(*p_mcp, active_volumes, tpc_volumes, id_to_ide_map, id_to_truehit_map, dprop, geo);
         fTrack->truth.eff = fTrack->truth.depE / (fTrack->truth.p.plane0VisE + fTrack->truth.p.plane1VisE + fTrack->truth.p.plane2VisE);
 
         // Lookup any Michel
@@ -686,7 +945,7 @@ void sbn::TrackCaloSkimmer::FillTrackTruth(const detinfo::DetectorClocksData &cl
               (d_mcp->Process() == "Decay" || d_mcp->Process() == "muMinusCaptureAtRest") && // correct process
               abs(d_mcp->PdgCode()) == 11) { // correct PDG code
 
-            fTrack->truth.michel = TrueParticleInfo(*d_mcp, active_volumes, tpc_volumes, id_to_ide_map, id_to_truehit_map);
+            fTrack->truth.michel = TrueParticleInfo(*d_mcp, active_volumes, tpc_volumes, id_to_ide_map, id_to_truehit_map, dprop, geo);
             break;
           }
         }
@@ -727,9 +986,13 @@ void sbn::TrackCaloSkimmer::FillTrack(const recob::Track &track,
     const recob::PFParticle &pfp, float t0, 
     const std::vector<art::Ptr<recob::Hit>> &hits,
     const std::vector<const recob::TrackHitMeta*> &thms,
+    const std::vector<art::Ptr<recob::SpacePoint>> &sps,
     const std::vector<art::Ptr<anab::Calorimetry>> &calo,
     const std::map<geo::WireID, art::Ptr<raw::RawDigit>> &rawdigits,
     const std::vector<GlobalTrackInfo> &tracks,
+    const geo::GeometryCore *geo,
+    const detinfo::DetectorClocksData &clock_data,
+    const cheat::BackTrackerService *bt_serv,
     const sbn::EDet det) {
 
   // Fill top level stuff
@@ -755,7 +1018,7 @@ void sbn::TrackCaloSkimmer::FillTrack(const recob::Track &track,
 
   // Fill each hit
   for (unsigned i_hit = 0; i_hit < hits.size(); i_hit++) {
-    sbn::TrackHitInfo hinfo = MakeHit(*hits[i_hit], hits[i_hit].key(), *thms[i_hit], track, calo);
+    sbn::TrackHitInfo hinfo = MakeHit(*hits[i_hit], hits[i_hit].key(), *thms[i_hit], track, sps[i_hit], calo, geo, clock_data, bt_serv);
     if (hinfo.h.plane == 0) {
       fTrack->hits0.push_back(hinfo);
     }
@@ -803,6 +1066,7 @@ void sbn::TrackCaloSkimmer::FillTrack(const recob::Track &track,
       winfo.wire = wire.Wire;
       winfo.plane = wire.Plane;
       winfo.tpc = wire.TPC;
+      winfo.channel = geo->PlaneWireToChannel(wire);
       winfo.tdc0 = min_tick;
       winfo.adcs = adcs;
 
@@ -824,11 +1088,24 @@ void sbn::TrackCaloSkimmer::FillTrack(const recob::Track &track,
 
   // get information on nearby tracks
   for (const GlobalTrackInfo &othr: tracks) {
+    if (othr.ID == track.ID()) continue;
+
     if ((track.End() - othr.start).r() < 50. || (track.End() - othr.end).r() < 50.) {
       fTrack->tracks_near_end_dist.push_back(std::min((track.End() - othr.start).r(), (track.End() - othr.end).r())); 
       fTrack->tracks_near_end_costh.push_back(
         (track.End() - othr.start).r() < (track.End() - othr.end).r() ? 
           track.EndDirection().Dot(othr.dir) : track.EndDirection().Dot(othr.enddir)); 
+    }
+  }
+
+  for (const GlobalTrackInfo &othr: tracks) {
+    if (othr.ID == track.ID()) continue;
+
+    if ((track.Start() - othr.start).r() < 50. || (track.Start() - othr.end).r() < 50.) {
+      fTrack->tracks_near_start_dist.push_back(std::min((track.Start() - othr.start).r(), (track.Start() - othr.end).r())); 
+      fTrack->tracks_near_start_costh.push_back(
+        (track.Start() - othr.start).r() < (track.Start() - othr.end).r() ? 
+          track.StartDirection().Dot(othr.dir) : track.StartDirection().Dot(othr.enddir)); 
     }
   }
 
@@ -901,7 +1178,11 @@ sbn::TrackHitInfo sbn::TrackCaloSkimmer::MakeHit(const recob::Hit &hit,
     unsigned hkey,
     const recob::TrackHitMeta &thm,
     const recob::Track &trk,
-    const std::vector<art::Ptr<anab::Calorimetry>> &calo) {
+    const art::Ptr<recob::SpacePoint> &sp,
+    const std::vector<art::Ptr<anab::Calorimetry>> &calo,
+    const geo::GeometryCore *geo,
+    const detinfo::DetectorClocksData &dclock,
+    const cheat::BackTrackerService *bt_serv) {
 
   // TrackHitInfo to save
   sbn::TrackHitInfo hinfo;
@@ -914,10 +1195,40 @@ sbn::TrackHitInfo sbn::TrackCaloSkimmer::MakeHit(const recob::Hit &hit,
   hinfo.h.mult = hit.Multiplicity();
   hinfo.h.wire = hit.WireID().Wire;
   hinfo.h.plane = hit.WireID().Plane;
+  hinfo.h.channel = geo->PlaneWireToChannel(hit.WireID());
   hinfo.h.tpc = hit.WireID().TPC;
   hinfo.h.end = hit.EndTick();
   hinfo.h.start = hit.StartTick();
   hinfo.h.id = (int)hkey;
+
+  // Do back-tracking on each hit
+  if (bt_serv) {
+    // The default BackTracking function goes from (peak - width, peak + width).
+    //
+    // This time range does not match well hits with a non-Gaussian shape where
+    // the Gaussian-fit-width does not replicate the width of the pulse. 
+    //
+    // Instead, we use the Hit (start, end) time range. This is also more relevant
+    // for (e.g.) the SummedADC charge extraction method.
+    //
+    // Don't use this:
+    // std::vector<sim::TrackIDE> ides = bt_serv->HitToTrackIDEs(dclock, hit);
+    //
+    // Use this:
+    std::vector<sim::TrackIDE> ides = bt_serv->ChannelToTrackIDEs(dclock, hit.Channel(), hit.StartTick(), hit.EndTick());
+
+    hinfo.h.truth.e = 0.;
+    hinfo.h.truth.nelec = 0.;
+
+    for (const sim::TrackIDE &ide: ides) {
+      hinfo.h.truth.e += ide.energy;
+      hinfo.h.truth.nelec += ide.numElectrons;
+    }
+  }
+  else {
+    hinfo.h.truth.e = -1.;
+    hinfo.h.truth.nelec = -1.;
+  }
 
   // look up the snippet
   sbn::TrackCaloSkimmer::Snippet snippet {hit.WireID(), hit.StartTick(), hit.EndTick()};
@@ -954,9 +1265,9 @@ sbn::TrackHitInfo sbn::TrackCaloSkimmer::MakeHit(const recob::Hit &hit,
   // Save trajectory information if we can
   if (!badhit) {
     geo::Point_t loc = trk.LocationAtPoint(thm.Index());
-    hinfo.h.p.x = loc.X();
-    hinfo.h.p.y = loc.Y();
-    hinfo.h.p.z = loc.Z();
+    hinfo.tp.x = loc.X();
+    hinfo.tp.y = loc.Y();
+    hinfo.tp.z = loc.Z();
 
     geo::Vector_t dir = trk.DirectionAtPoint(thm.Index());
     hinfo.dir.x = dir.X();
@@ -980,6 +1291,18 @@ sbn::TrackHitInfo sbn::TrackCaloSkimmer::MakeHit(const recob::Hit &hit,
       }
       break;
     }
+  }
+
+  // Save SpacePoint information
+  if (sp) {
+    hinfo.h.sp.x = sp->position().x();
+    hinfo.h.sp.y = sp->position().y();
+    hinfo.h.sp.z = sp->position().z();
+
+    hinfo.h.hasSP = true;
+  }
+  else {
+    hinfo.h.hasSP = false;
   }
 
   return hinfo;

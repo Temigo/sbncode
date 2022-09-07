@@ -26,12 +26,30 @@ namespace caf
     /*   Comment("true = hide sensitive info, false = include full record") */
     /* }; */
 
+    Atom<bool> CreateCAF { Name("CreateCAF"),
+      Comment("Whether to produce an output file in CAF format"), true
+    };
+
+    Atom<bool> CreateFlatCAF { Name("CreateFlatCAF"),
+      Comment("Whether to produce an output file in FlatCAF format"), true
+    };
+
     Atom<std::string> CAFFilename { Name("CAFFilename"),
-      Comment("Provide a string to override the automatic filename.")
+      Comment("Provide a string to override the automatic filename."), ""
+    };
+
+    Atom<std::string> FlatCAFFilename { Name("FlatCAFFilename"),
+      Comment("Provide a string to override the automatic filename."), ""
+    };
+
+    Atom<std::string> DetectorOverride { Name("DetectorOverride"),
+      Comment("Override the automatically detectected detector using 'sbnd' or 'icarus'. This parameter should usually be unset - ''"),
+      ""
     };
 
     Atom<string> DataTier        { Name("DataTier") };
-    Atom<string> FileExtension   { Name("FileExtension") };
+    Atom<string> FileExtension   { Name("FileExtension"), ".caf.root" };
+    Atom<string> FlatCAFFileExtension { Name("FlatCAFFileExtension"), ".flat.caf.root" };
     Atom<string> GeneratorLabel  { Name("GeneratorInput") };
 
     Atom<bool> StrictMode        { Name("StrictMode"),
@@ -53,6 +71,18 @@ namespace caf
     fhicl::OptionalSequence<std::string> PandoraTagSuffixes {
       Name("PandoraTagSuffixes"),
       Comment("List of suffixes to add to TPC reco tag names (e.g. cryo0 cryo1)")
+    };
+
+    Atom<string> BNBPOTDataLabel {
+      Name("BNBPOTDataLabel"),
+      Comment("Label of BNBRetriever module"),
+      "bnbinfo"
+    };
+
+    Atom<string> NuMIPOTDataLabel {
+      Name("NuMIPOTDataLabel"),
+      Comment("Label of NuMIRetriever module"),
+      "numiinfo"
     };
 
     Atom<string> G4Label {
@@ -95,6 +125,12 @@ namespace caf
       Name("FlashMatchLabel"),
       Comment("Base label of flash match producer."),
       "fmatch" // same for icarus and sbnd
+    };
+
+    Atom<string> CRUMBSLabel {
+      Name("CRUMBSLabel"),
+      Comment("Base label of CRUMBS ID producer."),
+      "crumbs"
     };
 
     Atom<string> HitLabel {
@@ -198,7 +234,25 @@ namespace caf
       Comment("Label of sbn CRT tracks."),
       "crttrack" // same for icarus and sbnd
     };
-    
+
+    Atom<string> OpFlashLabel {
+      Name("OpFlashLabel"),
+      Comment("Label of PMT flash."),
+      "OpFlash"
+    };
+
+    Atom<long long> CRTSimT0Offset {
+      Name("CRTSimT0Offset"),
+      Comment("start of beam gate/simulation time in the simulated CRT clock"),
+      0,
+    };
+
+    Atom<art::InputTag> TriggerLabel {
+      Name("TriggerLabel"),
+      Comment("Label of trigger."),
+      "daqTrigger"
+    };
+
     Atom<string> FlashTrigLabel {
       Name("FlashTrigLabel"),
       Comment("Label of bool of passing flash trigger."),
@@ -214,7 +268,7 @@ namespace caf
     Atom<string> SimChannelLabel {
       Name("SimChannelLabel"),
       Comment("Label of input sim::SimChannel objects."),
-      "largeant"
+      "simdrift"
     };
 
     Atom<bool> FillTrueParticles {
@@ -252,7 +306,6 @@ namespace caf
       Comment("How long from the end of a track to save calo-point information. Set to -1 to save nothing"),
       25.
     };
-
   };
 }
 

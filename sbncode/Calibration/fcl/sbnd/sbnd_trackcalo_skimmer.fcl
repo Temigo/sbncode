@@ -1,6 +1,6 @@
 BEGIN_PROLOG
 
-caloskim_pandoraCalo: {
+caloskim_calorimetry: {
   AssocHitModuleLabel: ""
   CaloAlg: {
     CalAmpConstants: [ 1., 1., 1.] 
@@ -16,6 +16,7 @@ caloskim_pandoraCalo: {
   T0ModuleLabel: ""
   TrackIsFieldDistortionCorrected: false
   TrackModuleLabel: "pandoraTrack"
+  NormTools: []
   module_type: "GnocchiCalorimetry"
 }
 
@@ -24,7 +25,7 @@ caloskim: {
   module_type: TrackCaloSkimmer
   CALOproducer: "caloskimCalorimetry"
   TRKproducer:  "pandoraTrack"
-  T0producer: "pandora"
+  T0producers: ["pandora"]
   PFPproducer: "pandora"
   G4producer: "largeant"
   SimChannelproducer: "simdrift"
@@ -44,14 +45,16 @@ stopping_selection: {
   tool_type: TrackCaloSkimmerSelectStoppingTrack
   FVInsetMinX: 15
   FVInsetMaxX: 15
-  FVInsetMinY: 25
+  FVInsetMinY: 15
   FVInsetMaxY: 15
   FVInsetMinZ: 15
   FVInsetMaxZ: 15
   MinTimeTickInset: 100
   MaxTimeTickInset: 100
-  EndMediandQdxCut: 1200
+  EndMediandQdxCut: 1600
   NumberTimeSamples: 3400
+  MediandQdxRRMax: 5.
+  CheckFiducialX: false
 }
 
 throughgoing_selection: {
@@ -69,6 +72,7 @@ throughgoing_selection: {
   EndMediandQdxCut: -1
   RequireDownwards: false
   NumberTimeSamples: 3400
+  CheckFiducialX: false
 }
 
 a2c_selection: {

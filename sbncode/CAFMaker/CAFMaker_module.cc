@@ -17,6 +17,7 @@
 #include "sbncode/CAFMaker/FillFlashMatch.h"
 #include "sbncode/CAFMaker/FillTrue.h"
 #include "sbncode/CAFMaker/FillReco.h"
+#include "sbncode/CAFMaker/FillExposure.h"
 #include "sbncode/CAFMaker/Utils.h"
 
 // C/C++ includes
@@ -37,7 +38,7 @@
 #include <libgen.h>
 #endif
 
-#include <IFDH_service.h>
+#include "ifdh_art/IFDHService/IFDH_service.h"
 
 // ROOT includes
 #include "TFile.h"
@@ -60,6 +61,7 @@
 #include "lardata/DetectorInfoServices/DetectorClocksService.h"
 #include "lardataalg/DetectorInfo/DetectorPropertiesStandard.h"
 #include "lardata/DetectorInfoServices/DetectorPropertiesService.h"
+#include "larcore/CoreUtils/ServiceUtil.h"
 
 #include "art_root_io/TFileService.h"
 
@@ -99,14 +101,21 @@
 #include "sbnobj/Common/Reco/MVAPID.h"
 #include "sbnobj/Common/Reco/ScatterClosestApproach.h"
 #include "sbnobj/Common/Reco/StoppingChi2Fit.h"
+#include "sbnobj/Common/POTAccounting/BNBSpillInfo.h"
+#include "sbnobj/Common/POTAccounting/NuMISpillInfo.h"
+#include "sbnobj/Common/Reco/CRUMBSResult.h"
+
 
 #include "canvas/Persistency/Provenance/ProcessConfiguration.h"
 #include "larcoreobj/SummaryData/POTSummary.h"
 
 // StandardRecord
 #include "sbnanaobj/StandardRecord/StandardRecord.h"
-
 #include "sbnanaobj/StandardRecord/SRGlobal.h"
+
+#include "sbnanaobj/StandardRecord/Flat/FlatRecord.h"
+#include "lardataobj/RawData/ExternalTrigger.h"
+#include "lardataobj/RawData/TriggerData.h"
 
 // // CAFMaker
 #include "sbncode/CAFMaker/AssociationUtil.h"
@@ -156,9 +165,7 @@ class CAFMaker : public art::EDProducer {
   CAFMakerParams fParams;
 
   std::string fCafFilename;
-
-  bool   fIsRealData;  // use this instead of evt.isRealData(), see init in
-                     // produce(evt)
+  std::string fFlatCafFilename;
 
   bool fFirstInSubRun;
   bool fFirstInFile;
@@ -167,15 +174,19 @@ class CAFMaker : public art::EDProducer {
   double fSubRunPOT;
   double fTotalSinglePOT;
   double fTotalEvents;
+  std::vector<caf::SRBNBInfo> fBNBInfo; ///< Store detailed BNB info to save into the first StandardRecord of the output file
+  std::vector<caf::SRNuMIInfo> fNuMIInfo; ///< Store detailed NuMI info to save into the first StandardRecord of the output file
+
   // int fCycle;
   // int fBatch;
 
-  TFile* fFile;
-  TTree* fRecTree;
+  TFile* fFile = 0;
+  TTree* fRecTree = 0;
 
-  TH1D* hPOT;
-  TH1D* hSinglePOT;
-  TH1D* hEvents;
+  TFile* fFlatFile = 0;
+  TTree* fFlatTree = 0;
+
+  flat::Flat<caf::StandardRecord>* fFlatRecord = 0;
 
   Det_t fDet;  ///< Detector ID in caf namespace typedef
 
@@ -191,10 +202,16 @@ class CAFMaker : public art::EDProducer {
   /// Map from parameter labels to previously seen parameter set configuration
   std::map<std::string, std::vector<sbn::evwgh::EventWeightParameterSet>> fPrevWeightPSet;
 
-  void AddEnvToFile();
-  void AddMetadataToFile(const std::map<std::string, std::string>& metadata);
+  std::string DeriveFilename(const std::string& inname,
+                             const std::string& ext) const;
 
-  void InitializeOutfile();
+  void AddEnvToFile(TFile* f);
+  void AddMetadataToFile(TFile* f,
+                         const std::map<std::string, std::string>& metadata);
+  void AddGlobalTreeToFile(TFile* outfile, caf::SRGlobal& global) const;
+  void AddHistogramsToFile(TFile* outfile) const;
+
+  void InitializeOutfiles();
 
   void InitVolumes(); ///< Initialize volumes from Gemotry service
 
@@ -208,6 +225,13 @@ class CAFMaker : public art::EDProducer {
   art::FindManyP<T, D> FindManyPDStrict(const U& from,
                                         const art::Event& evt,
                                         const art::InputTag& tag) const;
+
+  /// Equivalent of FindOneP except a return that is !isValid() prints a
+  /// messsage and aborts if StrictMode is true.
+  template <class T, class U>
+  art::FindOneP<T> FindOnePStrict(const U& from, const art::Event& evt,
+				  const art::InputTag& label) const;
+
 
   /// \brief Retrieve an object from an association, with error handling
   ///
@@ -258,11 +282,15 @@ class CAFMaker : public art::EDProducer {
 }; //Producer
 
 //.......................................................................
+
   CAFMaker::CAFMaker(const Parameters& params)
   : art::EDProducer{params},
-    fParams(params()), fIsRealData(false), fFile(0)
+    fParams(params()), fFile(0)
   {
+  // Note: we will define isRealData on a per event basis in produce function [using event.isRealData()], at least for now.
+
   fCafFilename = fParams.CAFFilename();
+  fFlatCafFilename = fParams.FlatCAFFilename();
 
   // Normally CAFMaker is run wit no output ART stream, so these go
   // nowhere, but can be occasionally useful for filtering in ART
@@ -309,23 +337,47 @@ void CAFMaker::InitVolumes() {
 }
 
 //......................................................................
-CAFMaker::~CAFMaker() {}
+CAFMaker::~CAFMaker()
+{
+  delete fRecTree;
+  delete fFile;
+
+  delete fFlatRecord;
+  delete fFlatTree;
+  delete fFlatFile;
+
+  delete fFakeRecoTRandom;
+}
+
+//......................................................................
+std::string CAFMaker::DeriveFilename(const std::string& inname,
+                                     const std::string& ext) const
+{
+  char* temp = new char[inname.size()+1];
+  std::strcpy(temp, inname.c_str());
+  std::string ret = basename(temp);
+  delete[] temp;
+  const size_t dotpos = ret.rfind('.'); // Find last dot
+  assert(dotpos != std::string::npos);  // Must have a dot, surely?
+  ret.resize(dotpos); // Truncate everything after dot
+  ret += ext;
+  return ret;
+}
 
 //......................................................................
 void CAFMaker::respondToOpenInputFile(const art::FileBlock& fb) {
-  if (!fFile) {
+  if ((fParams.CreateCAF() && !fFile) ||
+      (fParams.CreateFlatCAF() && !fFlatFile)) {
     // If Filename wasn't set in the FCL, and this is the
     // first file we've seen
-    const int sizef = fb.fileName().size() + 1;
-    char* temp  = new char[sizef];
-    std::strcpy(temp, fb.fileName().c_str());
-    fCafFilename = basename(temp);
-    const size_t dotpos = fCafFilename.find('.');
-    assert(dotpos != std::string::npos);  // Must have a dot, surely?
-    fCafFilename.resize(dotpos);
-    fCafFilename += fParams.FileExtension();
+    if(fParams.CreateCAF() && fCafFilename.empty()){
+      fCafFilename = DeriveFilename(fb.fileName(), fParams.FileExtension());
+    }
+    if(fParams.CreateFlatCAF() && fFlatCafFilename.empty()){
+      fFlatCafFilename = DeriveFilename(fb.fileName(), fParams.FlatCAFFileExtension());
+    }
 
-    InitializeOutfile();
+    InitializeOutfiles();
   }
 
   fFileNumber ++;
@@ -334,12 +386,35 @@ void CAFMaker::respondToOpenInputFile(const art::FileBlock& fb) {
 }
 
 //......................................................................
-void CAFMaker::beginJob() {
-  if (!fCafFilename.empty()) InitializeOutfile();
+void CAFMaker::beginJob()
+{
+}
+
+//......................................................................
+void CAFMaker::AddGlobalTreeToFile(TFile* outfile, caf::SRGlobal& global) const
+{
+  outfile->cd();
+
+  TTree* globalTree = new TTree("globalTree", "globalTree");
+  SRGlobal* pglobal = &global;
+  TBranch* br = globalTree->Branch("global", "caf::SRGlobal", &pglobal);
+  if(!br) abort();
+  globalTree->Fill();
+  globalTree->Write();
 }
 
 //......................................................................
 void CAFMaker::beginRun(art::Run& run) {
+  fDet = kUNKNOWN;
+
+  caf::Det_t override = kUNKNOWN;
+  if(fParams.DetectorOverride() == "sbnd") override = kSBND;
+  if(fParams.DetectorOverride() == "icarus") override = kICARUS;
+  if(!fParams.DetectorOverride().empty() && override == kUNKNOWN){
+    std::cout << "CAFMaker: unrecognized value for DetectorOverride parameter: '" << fParams.DetectorOverride() << "'" << std::endl;
+    abort();
+  }
+
   // Heuristic method to determine the detector ID
   const geo::GeometryCore* geom = lar::providerFrom<geo::Geometry>();
 
@@ -347,15 +422,18 @@ void CAFMaker::beginRun(art::Run& run) {
   gdml = basename(gdml.c_str()); // strip directory part
   std::cout << "CAFMaker: Attempting to deduce detector from GDML file name: '" << gdml
             << "' and configured detector name: '" << geom->DetectorName() << "'. ";
+  // Lowercase filename, in case it contains "SBND" or "Icarus" etc
+  for(unsigned int i = 0; i < gdml.size(); ++i) gdml[i] = std::tolower(gdml[i]);
   // Do we find the string in either of the names?
   const bool hasSBND = ((gdml.find("sbnd") != std::string::npos) ||
                         (geom->DetectorName().find("sbnd") != std::string::npos));
   const bool hasIcarus = ((gdml.find("icarus") != std::string::npos) ||
                           (geom->DetectorName().find("icarus") != std::string::npos));
+
   // Either no evidence, or ambiguous evidence
   if(hasSBND == hasIcarus){
-    std::cout << "Unable to determine detector!" << std::endl;
-    abort();
+    std::cout << "Unable to automatically determine detector!" << std::endl;
+    if(override == kUNKNOWN) abort();
   }
   // Now must be one or the other
   if(hasSBND){
@@ -367,6 +445,21 @@ void CAFMaker::beginRun(art::Run& run) {
     std::cout << "Detected Icarus" << std::endl;
   }
 
+  if(override != kUNKNOWN){
+    std::cout << "Detector set to ";
+    std::cout << ((override == kSBND) ? "SBND" : "Icarus");
+    std::cout << " based on user configuration." << std::endl;
+    if(fDet == override){
+      std::cout << "  This was redundant with the auto-detection. Suggest to not specify DetectorOverride" << std::endl;
+    }
+    else if(fDet != kUNKNOWN){
+      std::cout << "  This OVERRODE the auto-detection. Are you sure this is what you wanted?" << std::endl;
+    }
+    fDet = override;
+  }
+
+
+  if(fParams.SystWeightLabels().empty()) return; // no need for globalTree
 
   SRGlobal global;
 
@@ -404,35 +497,52 @@ void CAFMaker::beginRun(art::Run& run) {
     } // end for pset
   } // end for label
 
-  fFile->cd();
-  TTree* globalTree = new TTree("globalTree", "globalTree");
-  SRGlobal* pglobal = &global;
-  TBranch* br = globalTree->Branch("global", "caf::SRGlobal", &pglobal);
-  if(!br) abort();
-  globalTree->Fill();
-  globalTree->Write();
+  if(fFile) AddGlobalTreeToFile(fFile, global);
+  if(fFlatFile) AddGlobalTreeToFile(fFlatFile, global);
 }
 
 //......................................................................
 void CAFMaker::beginSubRun(art::SubRun& sr) {
-  // get the POT
-  // get POT information
-  art::Handle<sumdata::POTSummary> pot_handle;
-  sr.getByLabel("generator", pot_handle);
 
-  if (pot_handle.isValid()) {
+  // get POT information
+  fBNBInfo.clear();
+  fNuMIInfo.clear();
+  fSubRunPOT = 0;
+
+  if(auto bnb_spill = sr.getHandle<std::vector<sbn::BNBSpillInfo>>(fParams.BNBPOTDataLabel())){
+    FillExposure(*bnb_spill, fBNBInfo, fSubRunPOT);
+    fTotalPOT += fSubRunPOT;
+  }
+  else if (auto numi_spill = sr.getHandle<std::vector<sbn::NuMISpillInfo>>(fParams.NuMIPOTDataLabel())) {
+    FillExposureNuMI(*numi_spill, fNuMIInfo, fSubRunPOT);
+    fTotalPOT += fSubRunPOT;
+  }
+  else if(auto pot_handle = sr.getHandle<sumdata::POTSummary>(fParams.GenLabel())){
     fSubRunPOT = pot_handle->totgoodpot;
     fTotalPOT += fSubRunPOT;
   }
+  else{
+    if(!fParams.BNBPOTDataLabel().empty() || !fParams.GenLabel().empty() || !fParams.NuMIPOTDataLabel().empty()){
+      std::cout << "Found neither BNB data POT info under '"
+                << fParams.BNBPOTDataLabel()
+                << "' not NuMIdata POT info under '"
+                << fParams.NuMIPOTDataLabel()
+                << "' nor MC POT info under '"
+                << fParams.GenLabel() << "'"
+                << std::endl;
+      if(fParams.StrictMode()) abort();
+    }
+
+    // Otherwise, if one label is blank, maybe no POT was the expected result
+  }
+
   std::cout << "POT: " << fSubRunPOT << std::endl;
 
   fFirstInSubRun = true;
-
-
 }
 
 //......................................................................
-void CAFMaker::AddEnvToFile()
+void CAFMaker::AddEnvToFile(TFile* outfile)
 {
   // Global information about the processing details:
   std::map<std::string, std::string> envmap;
@@ -478,7 +588,7 @@ void CAFMaker::AddEnvToFile()
 
   envmap["cmd"] = cmd;
 
-  fFile->mkdir("env")->cd();
+  outfile->mkdir("env")->cd();
 
   TTree* trenv = new TTree("envtree", "envtree");
   std::string key, value;
@@ -493,11 +603,9 @@ void CAFMaker::AddEnvToFile()
 }
 
 //......................................................................
-void CAFMaker::AddMetadataToFile(const std::map<std::string, std::string>& metadata)
+void CAFMaker::AddMetadataToFile(TFile* outfile, const std::map<std::string, std::string>& metadata)
 {
-  assert(fFile && "CAFMaker: Trying to add metadata to an uninitialized file");
-
-  fFile->mkdir("metadata")->cd();
+  outfile->mkdir("metadata")->cd();
 
   TTree* trmeta = new TTree("metatree", "metatree");
   std::string key, value;
@@ -512,24 +620,36 @@ void CAFMaker::AddMetadataToFile(const std::map<std::string, std::string>& metad
 }
 
 //......................................................................
-void CAFMaker::InitializeOutfile() {
-  assert(!fFile);
-  assert(!fCafFilename.empty());
+void CAFMaker::InitializeOutfiles()
+{
+  if(fParams.CreateCAF()){
+    mf::LogInfo("CAFMaker") << "Output filename is " << fCafFilename;
 
-  mf::LogInfo("CAFMaker") << "Output filename is " << fCafFilename;
+    fFile = new TFile(fCafFilename.c_str(), "RECREATE");
 
-  fFile = new TFile(fCafFilename.c_str(), "RECREATE");
+    fRecTree = new TTree("recTree", "records");
 
-  hPOT = new TH1D("TotalPOT", "TotalPOT;; POT", 1, 0, 1);
-  hSinglePOT =
-      new TH1D("TotalSinglePOT", "TotalSinglePOT;; Single POT", 1, 0, 1);
-  hEvents = new TH1D("TotalEvents", "TotalEvents;; Events", 1, 0, 1);
+    // Tell the tree it's expecting StandardRecord objects
+    StandardRecord* rec = 0;
+    fRecTree->Branch("rec", "caf::StandardRecord", &rec);
 
-  fRecTree = new TTree("recTree", "records");
+    AddEnvToFile(fFile);
+  }
 
-  // Tell the tree it's expecting StandardRecord objects
-  StandardRecord* rec = 0;
-  fRecTree->Branch("rec", "caf::StandardRecord", &rec);
+  if(fParams.CreateFlatCAF()){
+    mf::LogInfo("CAFMaker") << "Output flat filename is " << fFlatCafFilename;
+
+    // LZ4 is the fastest format to decompress. I get 3x faster loading with
+    // this compared to the default, and the files are only slightly larger.
+    fFlatFile = new TFile(fFlatCafFilename.c_str(), "RECREATE", "",
+                          ROOT::CompressionSettings(ROOT::kLZ4, 1));
+
+    fFlatTree = new TTree("recTree", "recTree");
+
+    fFlatRecord = new flat::Flat<caf::StandardRecord>(fFlatTree, "rec", "", 0);
+
+    AddEnvToFile(fFlatFile);
+  }
 
   fFileNumber = -1;
   fTotalPOT = 0;
@@ -540,8 +660,6 @@ void CAFMaker::InitializeOutfile() {
   fFirstInSubRun = false;
   // fCycle = -5;
   // fBatch = -5;
-
-  AddEnvToFile();
 }
 
 //......................................................................
@@ -569,6 +687,25 @@ art::FindManyP<T, D> CAFMaker::FindManyPDStrict(const U& from,
                                             const art::Event& evt,
                                             const art::InputTag& tag) const {
   art::FindManyP<T, D> ret(from, evt, tag);
+
+  if (!tag.label().empty() && !ret.isValid() && fParams.StrictMode()) {
+    std::cout << "CAFMaker: No Assn from '"
+              << cet::demangle_symbol(typeid(from).name()) << "' to '"
+              << cet::demangle_symbol(typeid(T).name())
+              << "' found under label '" << tag << "'. "
+              << "Set 'StrictMode: false' to continue anyway." << std::endl;
+    abort();
+  }
+
+  return ret;
+}
+
+//......................................................................
+template <class T, class U>
+art::FindOneP<T> CAFMaker::FindOnePStrict(const U& from,
+					  const art::Event& evt,
+					  const art::InputTag& tag) const {
+  art::FindOneP<T> ret(from, evt, tag);
 
   if (!tag.label().empty() && !ret.isValid() && fParams.StrictMode()) {
     std::cout << "CAFMaker: No Assn from '"
@@ -642,6 +779,9 @@ bool CAFMaker::GetPsetParameter(const fhicl::ParameterSet& pset,
 
 //......................................................................
 void CAFMaker::produce(art::Event& evt) noexcept {
+
+  // is this event real data?
+  bool isRealData = evt.isRealData();
 
   std::unique_ptr<std::vector<caf::StandardRecord>> srcol(
       new std::vector<caf::StandardRecord>);
@@ -724,8 +864,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   GetByLabelStrict(evt, fParams.G4Label(), mc_particles);
 
   // collect services
-  art::ServiceHandle<cheat::ParticleInventoryService> pi_serv;
-  art::ServiceHandle<cheat::BackTrackerService> bt_serv;
+  // Moved ParticleInventory and BackTracker services definition as needed elsewhere (BH)
   auto const clock_data = art::ServiceHandle<detinfo::DetectorClocksService const>()->DataFor(evt);
   auto const dprop =
     art::ServiceHandle<detinfo::DetectorPropertiesService const>()->DataFor(evt, clock_data);
@@ -748,17 +887,28 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   }
 
   // Prep truth-to-reco-matching info
-  std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE*>>> id_to_ide_map = PrepSimChannels(simchannels, *geometry);
-  std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map = PrepTrueHits(hits, clock_data, *bt_serv.get());
+  std::map<int, std::vector<std::pair<geo::WireID, const sim::IDE*>>> id_to_ide_map;
+  std::map<int, std::vector<art::Ptr<recob::Hit>>> id_to_truehit_map;
+  std::map<int, caf::HitsEnergy> id_to_hit_energy_map;
+
+  if ( !isRealData ) {
+    art::ServiceHandle<cheat::BackTrackerService> bt_serv;
+
+    id_to_ide_map = PrepSimChannels(simchannels, *geometry);
+    id_to_truehit_map = PrepTrueHits(hits, clock_data, *bt_serv);
+    id_to_hit_energy_map = SetupIDHitEnergyMap(hits, clock_data, *bt_serv);
+  }
 
   //#######################################################
   // Fill truths & fake reco
   //#######################################################
 
   caf::SRTruthBranch                  srtruthbranch;
-  std::vector<caf::SRTrueInteraction> srneutrinos;
 
   if (mc_particles.isValid()) {
+    art::ServiceHandle<cheat::ParticleInventoryService> pi_serv;
+    art::ServiceHandle<cheat::BackTrackerService> bt_serv;
+
     for (const simb::MCParticle part: *mc_particles) {
       true_particles.emplace_back();
 
@@ -767,8 +917,8 @@ void CAFMaker::produce(art::Event& evt) noexcept {
                          fTPCVolumes,
                          id_to_ide_map,
                          id_to_truehit_map,
-                         *bt_serv.get(),
-                         *pi_serv.get(),
+                         *bt_serv,
+                         *pi_serv,
                          mctruths,
                          true_particles.back());
     }
@@ -789,9 +939,10 @@ void CAFMaker::produce(art::Event& evt) noexcept {
       std::cout << "Failed to get GTruth object!" << std::endl;
     }
 
-    srneutrinos.push_back(SRTrueInteraction());
+    srtruthbranch.nu.push_back(SRTrueInteraction());
+    srtruthbranch.nnu ++;
 
-    FillTrueNeutrino(mctruth, mcflux, gtruth, true_particles, id_to_truehit_map, srneutrinos.back(), i);
+    if ( !isRealData ) FillTrueNeutrino(mctruth, mcflux, gtruth, true_particles, id_to_truehit_map, srtruthbranch.nu.back(), i, fActiveVolumes);
 
     // Don't check for syst weight assocations until we have something (MCTruth
     // corresponding to a neutrino) that could plausibly be reweighted. This
@@ -812,12 +963,9 @@ void CAFMaker::produce(art::Event& evt) noexcept {
 
       // For all the weights associated with this MCTruth
       for(const art::Ptr<sbn::evwgh::EventWeightMap>& wgtmap: wgts){
-        FillEventWeight(*wgtmap, srneutrinos.back(), fWeightPSetIndex);
+        FillEventWeight(*wgtmap, srtruthbranch.nu.back(), fWeightPSetIndex);
       } // end for wgtmap
     } // end for fm
-
-    srtruthbranch.nu  = srneutrinos;
-    srtruthbranch.nnu = srneutrinos.size();
   } // end for i (mctruths)
 
   // get the number of events generated in the gen stage
@@ -840,7 +988,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   // Fill the MeVPrtl stuff
   for (unsigned i_prtl = 0; i_prtl < mevprtl_truths.size(); i_prtl++) {
     srtruthbranch.prtl.emplace_back();
-    FillMeVPrtlTruth(*mevprtl_truths[i_prtl], srtruthbranch.prtl.back());
+    FillMeVPrtlTruth(*mevprtl_truths[i_prtl], fActiveVolumes, srtruthbranch.prtl.back());
     srtruthbranch.nprtl = srtruthbranch.prtl.size();
   } 
 
@@ -866,10 +1014,39 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   GetByLabelStrict(evt, fParams.CRTHitLabel(), crthits_handle);
   // fill into event
   if (crthits_handle.isValid()) {
+
+    //==== gate start time
+    //==== 03/31/22 : 1600000 ns = 1.6 ms is the default T0Offset in MC
+    //==== https://github.com/SBNSoftware/icaruscode/blob/v09_37_02_01/icaruscode/CRT/crtsimmodules_icarus.fcl#L11
+    uint64_t m_gate_start_timestamp = fParams.CRTSimT0Offset(); // ns
+    if(isRealData){
+
+      art::Handle< std::vector<raw::ExternalTrigger> > externalTrigger_handle;
+      evt.getByLabel( fParams.TriggerLabel(), externalTrigger_handle );
+      const std::vector<raw::ExternalTrigger> &externalTrgs = *externalTrigger_handle;
+
+      art::Handle< std::vector<raw::Trigger> > trigger_handle;
+      evt.getByLabel( fParams.TriggerLabel(), trigger_handle );
+      const std::vector<raw::Trigger> &trgs = *trigger_handle;
+
+      if(externalTrgs.size()==1 && trgs.size()==1){
+        long long TriggerAbsoluteTime = externalTrgs[0].GetTrigTime(); // Absolute time of trigger
+        double BeamGateRelativeTime = trgs[0].BeamGateTime(); // BeamGate time w.r.t. electronics clock T0 in us
+        double TriggerRelativeTime = trgs[0].TriggerTime(); // Trigger time w.r.t. electronics clock T0 in us
+        m_gate_start_timestamp = TriggerAbsoluteTime + (int)(BeamGateRelativeTime*1000-TriggerRelativeTime*1000);
+      }
+      else{
+        std::cout << "Unexpected in " << evt.id() << ": there are " << trgs.size()
+          << " triggers in '" << fParams.TriggerLabel().encode() << "' data product."
+          << " Please contact CAFmaker maintainer." << std::endl;
+        abort();
+      }
+    }
+
     const std::vector<sbn::crt::CRTHit> &crthits = *crthits_handle;
     for (unsigned i = 0; i < crthits.size(); i++) {
       srcrthits.emplace_back();
-      FillCRTHit(crthits[i], fParams.CRTUseTS0(), srcrthits.back());
+      FillCRTHit(crthits[i], m_gate_start_timestamp, fParams.CRTUseTS0(), srcrthits.back());
     }
   }
 
@@ -884,6 +1061,23 @@ void CAFMaker::produce(art::Event& evt) noexcept {
     for (unsigned i = 0; i < crttracks.size(); i++) {
       srcrttracks.emplace_back();
       FillCRTTrack(crttracks[i], fParams.CRTUseTS0(), srcrttracks.back());
+    }
+  }
+
+  // Get all of the OpFlashes
+  std::vector<caf::SROpFlash> srflashes;
+
+  for (const std::string& pandora_tag_suffix : pandora_tag_suffixes) {
+    art::Handle<std::vector<recob::OpFlash>> flashes_handle;
+    GetByLabelStrict(evt, fParams.OpFlashLabel() + pandora_tag_suffix, flashes_handle);
+    // fill into event
+    if (flashes_handle.isValid()) {
+      const std::vector<recob::OpFlash> &opflashes = *flashes_handle;
+      int cryostat = ( pandora_tag_suffix.find("W") != std::string::npos ) ? 1 : 0;
+      for (const recob::OpFlash& flash : opflashes) {
+        srflashes.emplace_back();
+        FillOpFlash(flash, cryostat, srflashes.back());
+      }
     }
   }
 
@@ -937,6 +1131,14 @@ void CAFMaker::produce(art::Event& evt) noexcept {
     std::vector<art::Ptr<recob::Hit>> slcHits;
     if (fmSlcHits.isValid()) {
       slcHits = fmSlcHits.at(0);
+    }
+
+    art::FindOneP<sbn::CRUMBSResult> foSlcCRUMBS =
+      FindOnePStrict<sbn::CRUMBSResult>(sliceList, evt,
+          fParams.CRUMBSLabel() + slice_tag_suff);
+    const sbn::CRUMBSResult *slcCRUMBS = nullptr;
+    if (foSlcCRUMBS.isValid()) {
+      slcCRUMBS = foSlcCRUMBS.at(0).get();
     }
 
     art::FindManyP<sbn::SimpleFlashMatch> fm_sFM =
@@ -1107,6 +1309,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
     FillSliceFlashMatch(fmatch, recslc);
     FillSliceFlashMatchA(fmatch, recslc);
     FillSliceVertex(vertex, recslc);
+    FillSliceCRUMBS(slcCRUMBS, recslc);
 
     // select slice
     if (!SelectSlice(recslc, fParams.CutClearCosmic())) continue;
@@ -1118,12 +1321,16 @@ void CAFMaker::produce(art::Event& evt) noexcept {
     bool NeutrinoSlice = !recslc.is_clear_cosmic;
 
     // Fill truth info after decision on selection is made
-    FillSliceTruth(slcHits, mctruths, srneutrinos,
-       *pi_serv.get(), clock_data, recslc, rec.mc);
+    if ( !isRealData ) {
+      art::ServiceHandle<cheat::ParticleInventoryService> pi_serv;
 
-    FillSliceFakeReco(slcHits, mctruths, srneutrinos,
-       *pi_serv.get(), clock_data, recslc, rec.mc, mctracks, fActiveVolumes,
-       *fFakeRecoTRandom);
+      FillSliceTruth(slcHits, mctruths, srtruthbranch,
+		     *pi_serv, clock_data, recslc);
+
+      FillSliceFakeReco(slcHits, mctruths, srtruthbranch,
+			*pi_serv, clock_data, recslc, mctracks, fActiveVolumes,
+			*fFakeRecoTRandom);
+    }
 
     //#######################################################
     // Add detector dependent slice info.
@@ -1144,7 +1351,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
 
       rec.reco.stub.emplace_back();
       FillStubVars(thisStub, thisStubPFP, rec.reco.stub.back());
-      FillStubTruth(fmStubHits.at(iStub), true_particles, clock_data, rec.reco.stub.back());
+      if ( !isRealData ) FillStubTruth(fmStubHits.at(iStub), id_to_hit_energy_map, true_particles, clock_data, rec.reco.stub.back());
       rec.reco.nstub = rec.reco.stub.size();
 
       // Duplicate stub reco info in the srslice
@@ -1224,7 +1431,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
               lar::providerFrom<geo::Geometry>(), dprop, rec.reco.trk.back());
         }
         if (fmTrackHit.isValid()) {
-          FillTrackTruth(fmTrackHit.at(iPart), true_particles, clock_data, rec.reco.trk.back());
+          if ( !isRealData ) FillTrackTruth(fmTrackHit.at(iPart), id_to_hit_energy_map, true_particles, clock_data, rec.reco.trk.back());
         }
         // NOTE: SEE TODO's AT fmCRTHitMatch and fmCRTTrackMatch
         if (fmCRTHitMatch.isValid()) {
@@ -1266,7 +1473,7 @@ void CAFMaker::produce(art::Event& evt) noexcept {
           FillShowerDensityFit(*fmShowerDensityFit.at(iPart).front(), rec.reco.shw.back());
         }
         if (fmShowerHit.isValid()) {
-          FillShowerTruth(fmShowerHit.at(iPart), true_particles, clock_data, rec.reco.shw.back());
+          if ( !isRealData ) FillShowerTruth(fmShowerHit.at(iPart), id_to_hit_energy_map, true_particles, clock_data, rec.reco.shw.back());
         }
         // Duplicate track reco info in the srslice
         recslc.reco.shw.push_back(rec.reco.shw.back());
@@ -1306,6 +1513,8 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   rec.ncrt_hits       = srcrthits.size();
   rec.crt_tracks        = srcrttracks;
   rec.ncrt_tracks       = srcrttracks.size();
+  rec.opflashes       = srflashes;
+  rec.nopflashes      = srflashes.size();
   if (fParams.FillTrueParticles()) {
     rec.true_particles  = true_particles;
   }
@@ -1319,14 +1528,38 @@ void CAFMaker::produce(art::Event& evt) noexcept {
 
   rec.hdr = SRHeader();
 
+  // Get the Process and Cluser number
+  const char *process_str = std::getenv("PROCESS");
+  if (process_str) {
+    try {
+      rec.hdr.proc = std::stoi(process_str);
+    }
+    catch (...) {}
+  }
+
+  const char *cluster_str = std::getenv("CLUSTER");
+  if (cluster_str) {
+    try {
+      rec.hdr.cluster = std::stoi(cluster_str);
+    }
+    catch (...) {}
+  }
+
   rec.hdr.run     = run;
   rec.hdr.subrun  = subrun;
   rec.hdr.evt     = evtID;
   // rec.hdr.subevt = sliceID;
-  rec.hdr.ismc    = !fIsRealData;
+  rec.hdr.ismc    = !isRealData;
   rec.hdr.det     = fDet;
   rec.hdr.fno     = fFileNumber;
-  rec.hdr.pot     = fSubRunPOT;
+  if(fFirstInFile)
+  {
+    rec.hdr.pot   = fSubRunPOT;
+    rec.hdr.nbnbinfo = fBNBInfo.size();
+    rec.hdr.bnbinfo = fBNBInfo;
+    rec.hdr.nnumiinfo = fNuMIInfo.size();
+    rec.hdr.numiinfo = fNuMIInfo;
+  }
   rec.hdr.ngenevt = n_gen_evt;
   rec.hdr.mctype  = mctype;
   rec.hdr.first_in_file = fFirstInFile;
@@ -1340,19 +1573,46 @@ void CAFMaker::produce(art::Event& evt) noexcept {
   fFirstInFile = false;
   fFirstInSubRun = false;
 
-  // calculate information that needs information from all of the slices
-  // SetNuMuCCPrimary(recs, srneutrinos);
+  if(fRecTree){
+    // Save the standard-record
+    StandardRecord* prec = &rec;
+    fRecTree->SetBranchAddress("rec", &prec);
+    fRecTree->Fill();
+  }
 
-  // Save the standard-record
-  StandardRecord* prec = &rec;
-  fRecTree->SetBranchAddress("rec", &prec);
-  fRecTree->Fill();
+  if(fFlatTree){
+    fFlatRecord->Clear();
+    fFlatRecord->Fill(rec);
+    fFlatTree->Fill();
+  }
+
   srcol->push_back(rec);
   evt.put(std::move(srcol));
+
+  fBNBInfo.clear();
+  fNuMIInfo.clear();
+  rec.hdr.pot = 0;
 }
 
 void CAFMaker::endSubRun(art::SubRun& sr) {
 
+}
+
+//......................................................................
+void CAFMaker::AddHistogramsToFile(TFile* outfile) const
+{
+  outfile->cd();
+
+  TH1* hPOT = new TH1D("TotalPOT", "TotalPOT;; POT", 1, 0, 1);
+  //  TH1* hSinglePOT =
+  //    new TH1D("TotalSinglePOT", "TotalSinglePOT;; Single POT", 1, 0, 1);
+  TH1* hEvents = new TH1D("TotalEvents", "TotalEvents;; Events", 1, 0, 1);
+
+  hPOT->Fill(.5, fTotalPOT);
+  hEvents->Fill(.5, fTotalEvents);
+
+  hPOT->Write();
+  hEvents->Write();
 }
 
 //......................................................................
@@ -1367,17 +1627,22 @@ void CAFMaker::endJob() {
     return;
   }
 
-  // Make sure the recTree is in the file before filling other items
-  // for debugging.
-  fFile->Write();
 
-  fFile->cd();
-  hPOT->Fill(.5, fTotalPOT);
-  hEvents->Fill(.5, fTotalEvents);
+  if(fFile){
+    // Make sure the recTree is in the file before filling other items
+    // for debugging.
+    fFile->Write();
 
-  hPOT->Write();
-  hEvents->Write();
-  fFile->Write();
+    AddHistogramsToFile(fFile);
+    fFile->Write();
+  }
+
+  if(fFlatFile){
+    fFlatFile->Write();
+
+    AddHistogramsToFile(fFlatFile);
+    fFlatFile->Write();
+  }
 
   std::map<std::string, std::string> metamap;
 
@@ -1400,7 +1665,8 @@ void CAFMaker::endJob() {
     std::cout << "\n\nCAFMaker: TFileMetadataSBN service not configured -- this CAF will not have any metadata saved.\n" << std::endl;
   }
 
-  AddMetadataToFile(metamap);
+  if(fFile) AddMetadataToFile(fFile, metamap);
+  if(fFlatFile) AddMetadataToFile(fFlatFile, metamap);
 }
 
 
